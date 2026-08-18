@@ -1,20 +1,43 @@
 #!/usr/bin/env python3
-"""Deterministically compare Noir 1.2.1 JSON with noir-ts CSV evidence.
+r"""Deterministically compare OWASP Noir JSON with noir-ts CSV evidence.
 
-Example::
+Copy-paste example for existing reports (replace the three ``/path`` values)::
 
-    python3 -B compare_noir_noirts.py NOIR.json NOIRTS.csv \
-        --source-root SOURCE_CHECKOUT --output-dir COMPARISON_DIR
+    COMPARISON_DIR="$(mktemp -d /tmp/noir-noirts.XXXXXX)"
+    PYTHONDONTWRITEBYTECODE=1 python3 -B \
+      "/home/rs/rsw/noir-ts.files/_dl/sprint05/tools/compare_noir_noirts.py" \
+      "/path/to/noir-report.json" \
+      "/path/to/noir-ts-report.csv" \
+      --source-root "/path/to/analyzed-source" \
+      --output-dir "$COMPARISON_DIR"
+    sed -n '1,240p' "$COMPARISON_DIR/comparison.md"
+
+Copy-paste retained Keycloak replay (runs as written and writes only to a
+fresh temporary directory)::
+
+    COMPARISON_DIR="$(mktemp -d /tmp/noir-noirts-keycloak.XXXXXX)"
+    PYTHONDONTWRITEBYTECODE=1 python3 -B \
+      "/home/rs/rsw/noir-ts.files/_dl/sprint05/tools/compare_noir_noirts.py" \
+      "/home/rs/rsw/noir-ts.files/_dl/sprint04/reports/noir/01-keycloak-java-api-relative.json" \
+      "/home/rs/rsw/noir-ts.files/_dl/sprint04/reports/our-tool/noir-sbt-report.csv" \
+      --source-root "/home/rs/rsw/noir-ts.files/_dl/keycloak" \
+      --output-dir "$COMPARISON_DIR"
+    sed -n '1,240p' "$COMPARISON_DIR/comparison.md"
 
 The two positional arguments are the Noir JSON report and noir-ts semicolon
 CSV report. ``--output-dir`` selects the derived report directory (default:
 ``./comparison-noir-noirts``); ``--source-root`` optionally aligns source-file
 evidence to one analyzed checkout. Repeat ``--noir-technology`` to replace the
-default Java detector allowlist, or use ``--all-noir-http`` explicitly.
+default Java detector allowlist, or use ``--all-noir-http`` explicitly. The
+Noir input must be the single JSON object produced by ``--format json``; JSONL,
+YAML, and console text are not accepted. The schema is verified against OWASP
+Noir 0.29.0, 0.29.1, and 1.2.1.
 
 The comparator deliberately uses a narrow denominator:
 
-* Noir rows must be HTTP and belong to an allowed Java server technology.
+* Noir rows must be non-internal HTTP endpoints in an allowed Java server
+  technology. Noir ``internal: true`` rows represent client-side declarations
+  in the verified versions and stay outside the inbound-server denominator.
 * noir-ts rows must use the direct ``http METHOD`` interface form.
 * Exact normalized ``(method, path)`` identity is the primary match tier.
 * A conservative secondary tier matches placeholder shapes only when the best
@@ -51,7 +74,7 @@ from urllib.parse import urlsplit
 
 
 SCHEMA_VERSION = 1
-TOOL_VERSION = "0.1.0"
+TOOL_VERSION = "0.2.0"
 DEFAULT_NOIR_TECHNOLOGIES = (
     "java_jaxrs",
     "java_quarkus",
@@ -274,6 +297,15 @@ def _technology(endpoint: Mapping[str, Any]) -> str:
     return str(value or "").strip()
 
 
+def _internal(endpoint: Mapping[str, Any]) -> bool:
+    value = endpoint.get("internal", False)
+    if not isinstance(value, bool):
+        raise ComparatorError(
+            "Noir endpoint internal must be a boolean when present"
+        )
+    return value
+
+
 def _noir_sources(
     endpoint: Mapping[str, Any], source_root: Path | None
 ) -> tuple[list[str], int, set[str]]:
@@ -342,6 +374,7 @@ def parse_noir_report(
     for endpoint in endpoints:
         if not isinstance(endpoint, Mapping):
             raise ComparatorError("Noir endpoints entries must be objects")
+        internal = _internal(endpoint)
         protocol = str(endpoint.get("protocol") or "").strip().lower()
         technology = _technology(endpoint)
         method = str(endpoint.get("method") or "").strip().upper()
@@ -354,7 +387,9 @@ def parse_noir_report(
         canonical_path, transform = _canonical_server_path(url)
 
         reason = ""
-        if protocol != "http":
+        if internal:
+            reason = "internal_client"
+        elif protocol != "http":
             reason = f"protocol:{protocol or '<none>'}"
         elif (
             not all_http_technologies
@@ -1248,6 +1283,14 @@ def compare_reports(
     }
 
     warnings: list[str] = []
+    internal_clients = sum(
+        row["reason"] == "internal_client" for row in noir.noncomparable
+    )
+    if internal_clients:
+        warnings.append(
+            f"{internal_clients} Noir internal client endpoint object(s) were "
+            "inventoried outside the direct inbound HTTP server denominator."
+        )
     if noir.technology_fallback_used:
         warnings.append(
             "The Noir report has no technology metadata on any endpoint; HTTP rows "
@@ -1324,9 +1367,12 @@ def compare_reports(
             "absolute_http_url_rule": "remove scheme and authority for server-path comparison",
             "noirts_comparable_interface": "exact 'http METHOD' only",
             "noir_comparable_scope": (
-                "all HTTP technologies"
+                "all non-internal HTTP technologies"
                 if all_http_technologies
-                else "HTTP rows in the configured Java server technology allowlist"
+                else (
+                    "non-internal HTTP rows in the configured Java server "
+                    "technology allowlist"
+                )
             ),
             "noir_technologies": (
                 [] if all_http_technologies else sorted(technologies)
@@ -1472,13 +1518,36 @@ def compare_reports(
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
+    script_path = Path(__file__).resolve(strict=False)
     parser = argparse.ArgumentParser(
         description=(
-            "Compare direct Java HTTP server identities in Noir 1.2.1 JSON "
-            "and noir-ts semicolon CSV while inventorying other surfaces separately."
-        )
+            "Compare direct Java HTTP server identities in OWASP Noir JSON "
+            "(verified with 0.29.x and 1.2.1) and noir-ts semicolon CSV while "
+            "inventorying client and other surfaces separately."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=rf"""copy-paste example (replace the three /path values):
+  COMPARISON_DIR="$(mktemp -d /tmp/noir-noirts.XXXXXX)"
+  PYTHONDONTWRITEBYTECODE=1 python3 -B \
+    "{script_path}" \
+    "/path/to/noir-report.json" \
+    "/path/to/noir-ts-report.csv" \
+    --source-root "/path/to/analyzed-source" \
+    --output-dir "$COMPARISON_DIR"
+  sed -n '1,240p' "$COMPARISON_DIR/comparison.md"
+
+produce the required monolithic JSON with OWASP Noir 0.29.x:
+  NOIR_JSON="$(mktemp --suffix=.json /tmp/noir-0.29.XXXXXX)"
+  noir -b "/path/to/analyzed-source" --format json \
+    --output "$NOIR_JSON" --no-log --no-color
+
+JSONL, YAML, and log/console output are not valid NOIR_JSON inputs.""",
     )
-    parser.add_argument("noir_json", type=Path, help="Noir 1.2.1 JSON report")
+    parser.add_argument(
+        "noir_json",
+        type=Path,
+        help="OWASP Noir --format json report (verified: 0.29.x and 1.2.1)",
+    )
     parser.add_argument("noirts_csv", type=Path, help="noir-ts semicolon CSV report")
     parser.add_argument(
         "--output-dir",
